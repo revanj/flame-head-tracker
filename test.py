@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from tracker_base import Tracker
-from utils import video_to_images_original
+from utils.video_utils import video_to_images_original
 
 
 def plot(ret_dict, filename):
