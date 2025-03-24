@@ -662,7 +662,7 @@ class Tracker():
         # optimization loop
         if continue_fit:
             # continue to fit on the next video frame
-            total_iterations = 200
+            total_iterations = 2
         else:
             # initial fitting, take longer time
             total_iterations = 1000
@@ -784,7 +784,7 @@ class Tracker():
         )
 
         # optimization loop
-        for iter in range(200):
+        for iter in range(2):
 
             # update learning rate
             if iter == 100:

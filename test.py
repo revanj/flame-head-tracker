@@ -81,4 +81,4 @@ for i in range(len(video_frames)):
     if i % 10 == 0:
         current_time = time.time()
         print("processed", i, "frames in", current_time - start_time, "seconds")
-        print("that is", (current_time - start_time)/ i, "seconds per frame")
+        print("that is", (current_time - start_time)/ (i+1), "seconds per frame")
