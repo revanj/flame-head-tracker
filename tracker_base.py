@@ -645,7 +645,7 @@ class Tracker():
         d_camera_translation = nn.Parameter(torch.zeros(3).float().to(self.device))
         camera_params = [
             {'params': [d_camera_translation], 'lr': 0.01}, {'params': [d_camera_rotation], 'lr': 0.05}
-        ]'light'
+        ]
 
         # camera pose optimizer
         e_opt_rigid = torch.optim.Adam(
