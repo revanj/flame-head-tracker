@@ -818,6 +818,16 @@ class Tracker():
             e_opt_fine.zero_grad()
             loss.backward()
             e_opt_fine.step()
+            
+        ##############################
+        ## for displaying results    #
+        ##############################
+        with torch.no_grad():
+            optimized_shape = shape + d_shape
+            optimized_exp = exp + d_exp
+            optimized_pose = torch.from_numpy(params['pose']).to(self.device).detach()
+            optimized_pose[0,:3] *= 0 # we clear FLAME's head pose 
+            optimized_pose[:,3:] = optimized_pose[:,3:] + d_jaw # clear head pose and set jaw pose
 
         ####################
         # Prepare results  #
