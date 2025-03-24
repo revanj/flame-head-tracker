@@ -23,4 +23,4 @@ filterpy==1.4.5
 ipython==8.27.0
 jupyterlab
 git+https://github.com/NVlabs/nvdiffrast@v0.3.1
-git+https://github.com/facebookresearch/pytorch3d.git@0.7.8
+git+https://github.com/facebookresearch/pytorch3d.git@V0.7.8
