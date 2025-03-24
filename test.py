@@ -74,9 +74,8 @@ print("successfully read", len(video_frames), "video frames")
 # if realign == True, the fitting is on the realigned image
 # otherwise the fitting is on the original image
 ret_dict = tracker.run_bare(video_frames[0], realign=True, photometric_fitting=False, prev_ret_dict=None)
-for i in range len(video_frames):
+for i in range(len(video_frames)):
     frame = video_frames[i]
     ret_dict = tracker.run_bare(frame, realign=True, photometric_fitting=False, prev_ret_dict=ret_dict)
     if i % 10 == 0:
         print("processed", i, "frames")
-
