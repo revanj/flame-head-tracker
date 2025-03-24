@@ -1,5 +1,5 @@
 # Enviroment Setup
-import os, sys
+import os, sys, time
 WORKING_DIR = '/home/ruifanj2/workspace/Avatar/flame-head-tracker'
 os.chdir(WORKING_DIR) # change the working directory to the project's absolute path
 print("Current Working Directory: ", os.getcwd())
