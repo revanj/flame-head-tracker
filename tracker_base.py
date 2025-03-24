@@ -588,7 +588,7 @@ class Tracker():
 
         # convert the parameters to numpy arrays
         params = {}
-        for key in ['shape', 'tex', 'exp', 'pose', 'light']:
+        for key in ['shape', 'exp', 'pose']:
             if key == 'shape' and shape_code is not None:
                 # use pre-estimated global shape code
                 params[key] = shape_code.detach().cpu().numpy()
@@ -645,7 +645,7 @@ class Tracker():
         d_camera_translation = nn.Parameter(torch.zeros(3).float().to(self.device))
         camera_params = [
             {'params': [d_camera_translation], 'lr': 0.01}, {'params': [d_camera_rotation], 'lr': 0.05}
-        ]
+        ]'light'
 
         # camera pose optimizer
         e_opt_rigid = torch.optim.Adam(
@@ -657,190 +657,15 @@ class Tracker():
         shape = torch.from_numpy(params['shape']).to(self.device).detach()
         exp = torch.from_numpy(params['exp']).to(self.device).detach()
         pose = torch.from_numpy(params['pose']).to(self.device).detach()
-        pose[0,:3] *= 0 # we clear FLAME's head pose (we use camera pose instead)
 
-        # optimization loop
-        if continue_fit:
-            # continue to fit on the next video frame
-            total_iterations = 2
-        else:
-            # initial fitting, take longer time
-            total_iterations = 1000
-        for iter in range(total_iterations):
-
-            if continue_fit == False:
-                ## initial fitting
-                # update learning rate
-                if iter == 700:
-                    e_opt_rigid.param_groups[0]['lr'] = 0.005    # For translation
-                    e_opt_rigid.param_groups[1]['lr'] = 0.01     # For rotation
-                # update loss term weights
-                if iter <= 700: l_f = 100; l_c = 500 # more weights to contour
-                else: l_f = 500; l_c = 100 # more weights to face
-            else:
-                ## continue fitting
-                # update learning rate
-                e_opt_rigid.param_groups[0]['lr'] = 0.005    # For translation
-                e_opt_rigid.param_groups[1]['lr'] = 0.01     # For rotation
-                # update loss term weights
-                if iter <= 100: l_f = 100; l_c = 500 # more weights to contour
-                else: l_f = 500; l_c = 100 # more weights to face
-
-            vertices, _, _ = self.flame(shape_params=shape, expression_params=exp, pose_params=pose) # [1, N, 3]
-
-            # prep camera
-            optimized_camera_pose = camera_pose + torch.cat((d_camera_rotation, d_camera_translation))
-            Rt = create_diff_world_to_view_matrix(optimized_camera_pose)
-            cam = PerspectiveCamera(Rt=Rt, fov=self.fov, bg=self.bg_color, 
-                                    image_width=self.W, image_height=self.H, znear=self.znear, zfar=self.zfar)
-
-            # project landmarks via NV diff renderer
-            verts_clip = self.mesh_renderer.project_vertices_from_camera(vertices, cam)
-            verts_ndc_3d = verts_clip_to_ndc(verts_clip, image_size=self.H, out_dim=3) # convert the clipped vertices to NDC, output [N, 3]
-            landmarks3d = self.flame.seletec_3d68(verts_ndc_3d[None]) # [1, 68, 3]
-            landmarks2d = landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 68, 2]
-
-            # ears landmarks
-            if self.use_ear_landmarks:
-                left_ear_landmarks3d = verts_ndc_3d[self.L_EAR_INDICES][None]  # [1, 20, 3]
-                left_ear_landmarks2d = left_ear_landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 20, 2]
-                right_ear_landmarks3d = verts_ndc_3d[self.R_EAR_INDICES][None]  # [1, 20, 3]
-                right_ear_landmarks2d = right_ear_landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 20, 2]
-
-            EAR_LOSS_THRESHOLD = 0.2
-            loss_ear = 0
-            if self.use_ear_landmarks:
-                loss_l_ear = util.l2_distance(left_ear_landmarks2d, gt_ear_landmark)
-                loss_r_ear = util.l2_distance(right_ear_landmarks2d, gt_ear_landmark)
-                #loss_ear = torch.min(loss_l_ear, loss_r_ear) # select the one with the smallest loss
-                if loss_l_ear < EAR_LOSS_THRESHOLD:
-                    loss_ear = loss_ear + loss_l_ear
-                if loss_r_ear < EAR_LOSS_THRESHOLD:
-                    loss_ear = loss_ear + loss_r_ear
-                #print(loss_l_ear, loss_r_ear)
-            loss_ear = loss_ear * 100
-
-            # loss computation and optimization
-            loss_facial = util.l2_distance(landmarks2d[:, 17:, :2], gt_landmark[:, 17:, :2]) * l_f
-            loss_contour = util.l2_distance(landmarks2d[:, :17, :2], gt_landmark[:, :17, :2]) * l_c # contour loss
-            loss = loss_facial + loss_contour + loss_ear
-            e_opt_rigid.zero_grad()
-            loss.backward()
-            e_opt_rigid.step()
-
-        # the optimized camera pose from the Stage 1
-        optimized_camera_pose = camera_pose + torch.cat((d_camera_rotation, d_camera_translation))
-        optimized_camera_pose = optimized_camera_pose.detach()
-
-        if self.use_kalman_filter == True:
-            # apply Kalman filter on camera pose
-            optimized_camera_pose_np = optimized_camera_pose.cpu().numpy()[None] # [1,6]
-            R = optimized_camera_pose_np[:,:3]    # [1, 3]
-            T = optimized_camera_pose_np[:,3:]    # [1, 3]
-            # print(R, T)
-            R = kalman_filter_update_matrix(self.kf_R, R)
-            T = kalman_filter_update_matrix(self.kf_T, T)
-            # print(R, T)
-            # print('-----------------')
-            optimized_camera_pose = torch.from_numpy(np.concatenate([R, T], axis=1)[0]).to(self.device).detach()
-
-        # prepare camera for Stage 2
-        Rt = create_diff_world_to_view_matrix(optimized_camera_pose)
-        cam = PerspectiveCamera(Rt=Rt, fov=self.fov, bg=self.bg_color, 
-                                image_width=self.W, image_height=self.H, znear=self.znear, zfar=self.zfar)
-
-        ############################
-        ## Stage 2: fine fitting   #
-        ############################
-
-        # prepare shape code offsets (to be optimized)
-        d_shape = torch.zeros(params['shape'].shape)
-        d_shape = nn.Parameter(d_shape.float().to(self.device))
-
-        # prepare expression code offsets (to be optimized)
-        d_exp = torch.zeros(params['exp'].shape)
-        d_exp = nn.Parameter(d_exp.float().to(self.device))
-
-        # prepare jaw pose offsets (to be optimized)
-        d_jaw = torch.zeros(3)
-        d_jaw = nn.Parameter(d_jaw.float().to(self.device))    
         
-        # prepare eyes poses offsets (to be optimized)
-        eye_pose = torch.zeros(1,6) # FLAME's default_eyeball_pose are zeros
-        eye_pose = nn.Parameter(eye_pose.float().to(self.device))    
-
-        fine_params = [
-            {'params': [d_exp], 'lr': 0.01}, 
-            {'params': [d_jaw], 'lr': 0.025},
-            {'params': [eye_pose], 'lr': 0.03}
-        ]
-        # if shape_code is None:
-        #     fine_params.append({'params': [d_shape], 'lr': 0.01})
-
-        # fine optimizer
-        e_opt_fine = torch.optim.Adam(
-            fine_params,
-            weight_decay=0.0001
-        )
-
-        # optimization loop
-        for iter in range(2):
-
-            # update learning rate
-            if iter == 100:
-                e_opt_fine.param_groups[0]['lr'] = 0.005    
-                e_opt_fine.param_groups[1]['lr'] = 0.01     
-                e_opt_fine.param_groups[2]['lr'] = 0.01     
-
-            optimized_exp = exp + d_exp
-            optimized_pose = torch.from_numpy(params['pose']).to(self.device).detach()
-            optimized_pose[0,:3] *= 0 # we clear FLAME's head pose 
-            optimized_pose[:,3:] = optimized_pose[:,3:] + d_jaw
-            vertices, _, _ = self.flame(shape_params=shape+d_shape, 
-                                        expression_params=optimized_exp, 
-                                        pose_params=optimized_pose, 
-                                        eye_pose_params=eye_pose) # [1, N, 3]
-
-            # project landmarks via NV diff renderer
-            verts_clip = self.mesh_renderer.project_vertices_from_camera(vertices, cam)
-            verts_ndc_3d = verts_clip_to_ndc(verts_clip, image_size=self.H, out_dim=3) # convert the clipped vertices to NDC, output [N, 3]
-            landmarks3d = self.flame.seletec_3d68(verts_ndc_3d[None]) # [1, 68, 3]
-            landmarks2d = landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 68, 2]
-
-            # eyes landmarks
-            eyes_landmarks3d = verts_ndc_3d[self.R_EYE_INDICES + self.L_EYE_INDICES][None]  # [1, 10, 3]
-            eyes_landmarks2d = eyes_landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 10, 2]
-
-            # loss computation and optimization
-            loss_facial = util.l2_distance(landmarks2d[:, 17:, :2], gt_landmark[:, 17:, :2]) * 500
-            loss_eyes = util.l2_distance(eyes_landmarks2d, gt_eyes_landmark) * 500
-            loss = loss_facial + loss_eyes
-            e_opt_fine.zero_grad()
-            loss.backward()
-            e_opt_fine.step()
-            
-        ##############################
-        ## for displaying results    #
-        ##############################
-        with torch.no_grad():
-            optimized_shape = shape + d_shape
-            optimized_exp = exp + d_exp
-            optimized_pose = torch.from_numpy(params['pose']).to(self.device).detach()
-            optimized_pose[0,:3] *= 0 # we clear FLAME's head pose 
-            optimized_pose[:,3:] = optimized_pose[:,3:] + d_jaw # clear head pose and set jaw pose
-
         ####################
         # Prepare results  #
         ####################
         ret_dict = {
-            'vertices': vertices[0].detach().cpu().numpy(),  # [N, 3]
-            'shape': optimized_shape.detach().cpu().numpy(),    # [1,100]
-            'exp': optimized_exp.detach().cpu().numpy(),
-            'pose': optimized_pose.detach().cpu().numpy(),
-            'eye_pose': eye_pose.detach().cpu().numpy(),
-            'tex': params['tex'],
-            'light': params['light'],
-            'cam': optimized_camera_pose.detach().cpu().numpy(), # [6]
+            'shape': shape.detach().cpu().numpy(),    # [1,100]
+            'exp': exp.detach().cpu().numpy(),
+            'pose': pose.detach().cpu().numpy(),
         }
         
         return ret_dict
