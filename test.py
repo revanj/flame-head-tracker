@@ -65,24 +65,18 @@ tracker = Tracker(tracker_cfg)
 # tracker.update_fov(fov=20)                 # optional setting
 # tracker.set_landmark_detector('FAN')      # optional setting
 tracker.set_landmark_detector('mediapipe') # optional setting
+tracker.use_ear_landmarks = False
 
 video_path = './assets/obama.mp4'
 video_frames = video_to_images_original(video_path)
-
 print("successfully read", len(video_frames), "video frames")
-
-while(True):
-    pass
 
 # if realign == True, the fitting is on the realigned image
 # otherwise the fitting is on the original image
-ret_dict = tracker.load_image_and_run(img_path, realign=True, photometric_fitting=False) 
-plot(ret_dict, "realign.jpg")
+ret_dict = tracker.run_bare(video_frames[0], realign=True, photometric_fitting=False, prev_ret_dict=None)
+for i in range len(video_frames):
+    frame = video_frames[i]
+    ret_dict = tracker.run_bare(frame, realign=True, photometric_fitting=False, prev_ret_dict=ret_dict)
+    if i % 10 == 0:
+        print("processed", i, "frames")
 
-# realign=False
-ret_dict = tracker.load_image_and_run(img_path, realign=False, photometric_fitting=False) 
-plot(ret_dict, "no_realign.jpg")
-
-# check the shapes of returned results
-for key in ret_dict:
-    print(f'{key} {ret_dict[key].shape}')

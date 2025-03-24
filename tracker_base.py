@@ -308,6 +308,76 @@ class Tracker():
         img = read_img(img_path)
         return self.run(img, realign, photometric_fitting, prev_ret_dict, shape_code)
 
+    def run_bare(self, img, realign=True, photometric_fitting=False, prev_ret_dict=None, shape_code=None):
+        """
+        Run FLAME tracking on the given image
+        input:
+            -img: image data   numpy 
+            -realign: for FFHQ, use False. for in-the-wild images, use True
+            -photometric_fitting: whether to use photometric fitting or landmarks only
+            -prev_ret_dict: the results dictionary from the previous frame
+            -shape_code: the pre-estimated global shape code
+        output:
+            -ret_dict: results dictionary
+        """
+
+        # run Mediapipe face detector
+        lmks_dense, blend_scores = self.mediapipe_face_detection(img)
+        if lmks_dense is None:
+            # no face detected
+            return None
+        
+        if self.landmark_detector == 'mediapipe':
+            face_landmarks = convert_landmarks_mediapipe_to_dlib(lmks_mp=lmks_dense)
+        elif self.landmark_detector == 'FAN':
+            # run FAN face landmarks predictor
+            face_landmarks = self.fan_face_landmarks(img)
+            if face_landmarks is None:
+                # no face detected
+                return None
+        else:
+            return None
+        
+        # re-align image (tracking standard), this image will be used in our network model
+        img_aligned = image_align(img, face_landmarks, output_size=self.img_size, standard='tracking', 
+                                  padding_mode='constant')
+
+        if realign:
+            # realign == True means that we will fit on realigned image
+            img = img_aligned
+
+        # run DECA reconstruction
+        deca_dict = self.run_deca(img)
+
+        # run face parsing
+        parsing_mask = self.face_parser.run(img)
+        if realign: parsing_mask_aligned = parsing_mask
+        else: parsing_mask_aligned = self.face_parser.run(img_aligned)
+        
+        if photometric_fitting:
+            # run photometric fitting
+            face_mask = get_face_mask(parsing=parsing_mask, keep_ears=False)
+            ret_dict = self.run_fitting_photometric(img, face_mask, deca_dict, prev_ret_dict, shape_code)
+        else:
+            # run facial landmark-based fitting
+            ret_dict = self.run_fitting_bare(img, deca_dict, prev_ret_dict, shape_code)
+
+        # check for NaNs, if there is any, return None
+        _, nan_status = check_nan_in_dict(ret_dict)
+        if nan_status:
+            return None
+
+        # add more data
+        ret_dict['img'] = img
+        ret_dict['img_aligned'] = img_aligned
+        ret_dict['parsing'] = parsing_mask
+        ret_dict['parsing_aligned'] = parsing_mask_aligned
+        ret_dict['lmks_dense'] = lmks_dense
+        ret_dict['lmks_68'] = face_landmarks
+        ret_dict['blendshape_scores'] = blend_scores
+
+        return ret_dict
+
     
     def run(self, img, realign=True, photometric_fitting=False, prev_ret_dict=None, shape_code=None):
         """
@@ -504,6 +574,266 @@ class Tracker():
         deca_dict = self.deca.encode(images)
 
         return deca_dict
+
+    def run_fitting_bare(self, img, deca_dict, prev_ret_dict, shape_code):
+        """ Landmark-based Fitting        
+            - Stage 1: rigid fitting on the camera pose (6DoF) based on detected landmarks
+            - Stage 2: fine-tune the parameters including shape, tex, exp, pose, eye_pose, and light
+        """
+
+        if prev_ret_dict is not None:
+            continue_fit = True
+        else:
+            continue_fit = False
+
+        # convert the parameters to numpy arrays
+        params = {}
+        for key in ['shape', 'tex', 'exp', 'pose', 'light']:
+            if key == 'shape' and shape_code is not None:
+                # use pre-estimated global shape code
+                params[key] = shape_code.detach().cpu().numpy()
+            else:
+                params[key] = deca_dict[key].detach().cpu().numpy()
+
+        # resize for FLAME fitting
+        img_resized = cv2.resize(img, (self.flame_cfg.cropped_size, self.flame_cfg.cropped_size))
+
+        # run Mediapipe face detector
+        lmks_dense, _ = self.mediapipe_face_detection(img_resized)
+        if lmks_dense is None:
+            # no face detected
+            return None
+        lmks_dense[:, :2] = lmks_dense[:, :2] / float(self.flame_cfg.cropped_size) * 2 - 1 # normalize landmarks
+        
+        # gt_landmark can be either mediapipe's or FAN's landmarks
+        if self.landmark_detector == 'mediapipe':
+            face_landmarks = convert_landmarks_mediapipe_to_dlib(lmks_mp=lmks_dense)
+        elif self.landmark_detector == 'FAN':
+            # run FAN face landmarks predictor
+            face_landmarks = self.fan_face_landmarks(img_resized)
+            if face_landmarks is None:
+                # no face detected
+                return None
+            face_landmarks = face_landmarks[:, :2] / float(self.flame_cfg.cropped_size) * 2 - 1 # normalize landmarks
+
+        # prepare target 68 landmarks
+        gt_landmark = np.array(face_landmarks).astype(np.float32)
+        gt_landmark = torch.from_numpy(gt_landmark[None]).float().to(self.device)
+
+        # prepare target eyes landmarks
+        gt_eyes_landmark = np.array(lmks_dense[self.R_EYE_MP_LMKS + self.L_EYE_MP_LMKS]).astype(np.float32)
+        gt_eyes_landmark = torch.from_numpy(gt_eyes_landmark[None]).float().to(self.device)
+
+        # prepare ear 20 landmarks
+        if self.use_ear_landmarks:
+            ear_landmarks = self.detect_ear_landmarks(img_resized) # [20, 2] normalized ear landmarks
+            gt_ear_landmark = torch.from_numpy(ear_landmarks[None]).float().to(self.device) # [1, 20, 2]
+
+        ############################################################
+        ## Stage 1: rigid fitting (estimate the 6DoF camera pose)  #
+        ############################################################
+
+        # prepare 6DoF camera pose tensor
+        if continue_fit == False:
+            camera_pose = torch.tensor([0, 0, 0, 0, 0, self.distance], dtype=torch.float32).to(self.device) # [yaw, pitch, roll, x, y, z]
+        else:
+            # use previous frame's estimation to initialize
+            camera_pose = torch.tensor(prev_ret_dict['cam'], dtype=torch.float32).to(self.device)
+
+        # prepare camera pose offsets (to be optimized)
+        d_camera_rotation = nn.Parameter(torch.zeros(3).float().to(self.device))
+        d_camera_translation = nn.Parameter(torch.zeros(3).float().to(self.device))
+        camera_params = [
+            {'params': [d_camera_translation], 'lr': 0.01}, {'params': [d_camera_rotation], 'lr': 0.05}
+        ]
+
+        # camera pose optimizer
+        e_opt_rigid = torch.optim.Adam(
+            camera_params,
+            weight_decay=0.00001
+        )
+        
+        # DECA's results
+        shape = torch.from_numpy(params['shape']).to(self.device).detach()
+        exp = torch.from_numpy(params['exp']).to(self.device).detach()
+        pose = torch.from_numpy(params['pose']).to(self.device).detach()
+        pose[0,:3] *= 0 # we clear FLAME's head pose (we use camera pose instead)
+
+        # optimization loop
+        if continue_fit:
+            # continue to fit on the next video frame
+            total_iterations = 200
+        else:
+            # initial fitting, take longer time
+            total_iterations = 1000
+        for iter in range(total_iterations):
+
+            if continue_fit == False:
+                ## initial fitting
+                # update learning rate
+                if iter == 700:
+                    e_opt_rigid.param_groups[0]['lr'] = 0.005    # For translation
+                    e_opt_rigid.param_groups[1]['lr'] = 0.01     # For rotation
+                # update loss term weights
+                if iter <= 700: l_f = 100; l_c = 500 # more weights to contour
+                else: l_f = 500; l_c = 100 # more weights to face
+            else:
+                ## continue fitting
+                # update learning rate
+                e_opt_rigid.param_groups[0]['lr'] = 0.005    # For translation
+                e_opt_rigid.param_groups[1]['lr'] = 0.01     # For rotation
+                # update loss term weights
+                if iter <= 100: l_f = 100; l_c = 500 # more weights to contour
+                else: l_f = 500; l_c = 100 # more weights to face
+
+            vertices, _, _ = self.flame(shape_params=shape, expression_params=exp, pose_params=pose) # [1, N, 3]
+
+            # prep camera
+            optimized_camera_pose = camera_pose + torch.cat((d_camera_rotation, d_camera_translation))
+            Rt = create_diff_world_to_view_matrix(optimized_camera_pose)
+            cam = PerspectiveCamera(Rt=Rt, fov=self.fov, bg=self.bg_color, 
+                                    image_width=self.W, image_height=self.H, znear=self.znear, zfar=self.zfar)
+
+            # project landmarks via NV diff renderer
+            verts_clip = self.mesh_renderer.project_vertices_from_camera(vertices, cam)
+            verts_ndc_3d = verts_clip_to_ndc(verts_clip, image_size=self.H, out_dim=3) # convert the clipped vertices to NDC, output [N, 3]
+            landmarks3d = self.flame.seletec_3d68(verts_ndc_3d[None]) # [1, 68, 3]
+            landmarks2d = landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 68, 2]
+
+            # ears landmarks
+            if self.use_ear_landmarks:
+                left_ear_landmarks3d = verts_ndc_3d[self.L_EAR_INDICES][None]  # [1, 20, 3]
+                left_ear_landmarks2d = left_ear_landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 20, 2]
+                right_ear_landmarks3d = verts_ndc_3d[self.R_EAR_INDICES][None]  # [1, 20, 3]
+                right_ear_landmarks2d = right_ear_landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 20, 2]
+
+            EAR_LOSS_THRESHOLD = 0.2
+            loss_ear = 0
+            if self.use_ear_landmarks:
+                loss_l_ear = util.l2_distance(left_ear_landmarks2d, gt_ear_landmark)
+                loss_r_ear = util.l2_distance(right_ear_landmarks2d, gt_ear_landmark)
+                #loss_ear = torch.min(loss_l_ear, loss_r_ear) # select the one with the smallest loss
+                if loss_l_ear < EAR_LOSS_THRESHOLD:
+                    loss_ear = loss_ear + loss_l_ear
+                if loss_r_ear < EAR_LOSS_THRESHOLD:
+                    loss_ear = loss_ear + loss_r_ear
+                #print(loss_l_ear, loss_r_ear)
+            loss_ear = loss_ear * 100
+
+            # loss computation and optimization
+            loss_facial = util.l2_distance(landmarks2d[:, 17:, :2], gt_landmark[:, 17:, :2]) * l_f
+            loss_contour = util.l2_distance(landmarks2d[:, :17, :2], gt_landmark[:, :17, :2]) * l_c # contour loss
+            loss = loss_facial + loss_contour + loss_ear
+            e_opt_rigid.zero_grad()
+            loss.backward()
+            e_opt_rigid.step()
+
+        # the optimized camera pose from the Stage 1
+        optimized_camera_pose = camera_pose + torch.cat((d_camera_rotation, d_camera_translation))
+        optimized_camera_pose = optimized_camera_pose.detach()
+
+        if self.use_kalman_filter == True:
+            # apply Kalman filter on camera pose
+            optimized_camera_pose_np = optimized_camera_pose.cpu().numpy()[None] # [1,6]
+            R = optimized_camera_pose_np[:,:3]    # [1, 3]
+            T = optimized_camera_pose_np[:,3:]    # [1, 3]
+            # print(R, T)
+            R = kalman_filter_update_matrix(self.kf_R, R)
+            T = kalman_filter_update_matrix(self.kf_T, T)
+            # print(R, T)
+            # print('-----------------')
+            optimized_camera_pose = torch.from_numpy(np.concatenate([R, T], axis=1)[0]).to(self.device).detach()
+
+        # prepare camera for Stage 2
+        Rt = create_diff_world_to_view_matrix(optimized_camera_pose)
+        cam = PerspectiveCamera(Rt=Rt, fov=self.fov, bg=self.bg_color, 
+                                image_width=self.W, image_height=self.H, znear=self.znear, zfar=self.zfar)
+
+        ############################
+        ## Stage 2: fine fitting   #
+        ############################
+
+        # prepare shape code offsets (to be optimized)
+        d_shape = torch.zeros(params['shape'].shape)
+        d_shape = nn.Parameter(d_shape.float().to(self.device))
+
+        # prepare expression code offsets (to be optimized)
+        d_exp = torch.zeros(params['exp'].shape)
+        d_exp = nn.Parameter(d_exp.float().to(self.device))
+
+        # prepare jaw pose offsets (to be optimized)
+        d_jaw = torch.zeros(3)
+        d_jaw = nn.Parameter(d_jaw.float().to(self.device))    
+        
+        # prepare eyes poses offsets (to be optimized)
+        eye_pose = torch.zeros(1,6) # FLAME's default_eyeball_pose are zeros
+        eye_pose = nn.Parameter(eye_pose.float().to(self.device))    
+
+        fine_params = [
+            {'params': [d_exp], 'lr': 0.01}, 
+            {'params': [d_jaw], 'lr': 0.025},
+            {'params': [eye_pose], 'lr': 0.03}
+        ]
+        # if shape_code is None:
+        #     fine_params.append({'params': [d_shape], 'lr': 0.01})
+
+        # fine optimizer
+        e_opt_fine = torch.optim.Adam(
+            fine_params,
+            weight_decay=0.0001
+        )
+
+        # optimization loop
+        for iter in range(200):
+
+            # update learning rate
+            if iter == 100:
+                e_opt_fine.param_groups[0]['lr'] = 0.005    
+                e_opt_fine.param_groups[1]['lr'] = 0.01     
+                e_opt_fine.param_groups[2]['lr'] = 0.01     
+
+            optimized_exp = exp + d_exp
+            optimized_pose = torch.from_numpy(params['pose']).to(self.device).detach()
+            optimized_pose[0,:3] *= 0 # we clear FLAME's head pose 
+            optimized_pose[:,3:] = optimized_pose[:,3:] + d_jaw
+            vertices, _, _ = self.flame(shape_params=shape+d_shape, 
+                                        expression_params=optimized_exp, 
+                                        pose_params=optimized_pose, 
+                                        eye_pose_params=eye_pose) # [1, N, 3]
+
+            # project landmarks via NV diff renderer
+            verts_clip = self.mesh_renderer.project_vertices_from_camera(vertices, cam)
+            verts_ndc_3d = verts_clip_to_ndc(verts_clip, image_size=self.H, out_dim=3) # convert the clipped vertices to NDC, output [N, 3]
+            landmarks3d = self.flame.seletec_3d68(verts_ndc_3d[None]) # [1, 68, 3]
+            landmarks2d = landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 68, 2]
+
+            # eyes landmarks
+            eyes_landmarks3d = verts_ndc_3d[self.R_EYE_INDICES + self.L_EYE_INDICES][None]  # [1, 10, 3]
+            eyes_landmarks2d = eyes_landmarks3d[:,:,:2] / float(self.flame_cfg.cropped_size) * 2 - 1  # [1, 10, 2]
+
+            # loss computation and optimization
+            loss_facial = util.l2_distance(landmarks2d[:, 17:, :2], gt_landmark[:, 17:, :2]) * 500
+            loss_eyes = util.l2_distance(eyes_landmarks2d, gt_eyes_landmark) * 500
+            loss = loss_facial + loss_eyes
+            e_opt_fine.zero_grad()
+            loss.backward()
+            e_opt_fine.step()
+
+        ####################
+        # Prepare results  #
+        ####################
+        ret_dict = {
+            'vertices': vertices[0].detach().cpu().numpy(),  # [N, 3]
+            'shape': optimized_shape.detach().cpu().numpy(),    # [1,100]
+            'exp': optimized_exp.detach().cpu().numpy(),
+            'pose': optimized_pose.detach().cpu().numpy(),
+            'eye_pose': eye_pose.detach().cpu().numpy(),
+            'tex': params['tex'],
+            'light': params['light'],
+            'cam': optimized_camera_pose.detach().cpu().numpy(), # [6]
+        }
+        
+        return ret_dict
 
     
     def run_fitting(self, img, deca_dict, prev_ret_dict, shape_code):
