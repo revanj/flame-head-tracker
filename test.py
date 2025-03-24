@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from tracker_base import Tracker
+from utils import video_to_images_original
 
 
 def plot(ret_dict, filename):
@@ -61,11 +62,17 @@ tracker_cfg = {
 
 tracker = Tracker(tracker_cfg)
 
-tracker.update_fov(fov=20)                 # optional setting
-#tracker.set_landmark_detector('FAN')      # optional setting
+# tracker.update_fov(fov=20)                 # optional setting
+# tracker.set_landmark_detector('FAN')      # optional setting
 tracker.set_landmark_detector('mediapipe') # optional setting
 
-img_path = './assets/test_face.jpg'
+video_path = './assets/obama.mp4'
+video_frames = video_to_images_original(video_path)
+
+print("successfully read", len(video_frames), "video frames")
+
+while(True):
+    pass
 
 # if realign == True, the fitting is on the realigned image
 # otherwise the fitting is on the original image

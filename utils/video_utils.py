@@ -32,12 +32,23 @@ def video_to_images(video_path, original_fps = 60, subsample_fps = 30):
 
     return subsampled_frames
 
+def video_to_images_original(video_path, max_len = 2400):
+    # Open the video file
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        print(f"Error: Unable to open video file {video_path}")
+        return
+    
+    frames = []
+    while True:
+        if len(frames) >= max_len:
+            break
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+    cap.release()
 
-
-
-
-
-
-
-
-
+    return frames
