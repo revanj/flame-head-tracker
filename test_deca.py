@@ -75,9 +75,10 @@ print("successfully read", len(video_frames), "video frames")
 # otherwise the fitting is on the original image
 start_time = time.time()
 for i in range(len(video_frames)):
-    frame = video_frames[i]
-    tracker.run_bare(frame, realign=True, photometric_fitting=False)
-    if i % 10 == 0:
+    tracker.run_deca(video_frames[i])
+    if i % 100 == 0:
         current_time = time.time()
         print("processed", i, "frames in", current_time - start_time, "seconds")
-        print("that is", (current_time - start_time)/ (i+1), "seconds per frame")
+        print("that is", (current_time - start_time)/100, "seconds per frame")
+        print("and", 100/(current_time - start_time), "fps")
+        start_time = time.time()

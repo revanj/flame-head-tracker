@@ -553,8 +553,9 @@ class Tracker():
         """ Run DECA on a single input image """
 
         # DECA Encode
-        image = self.deca.crop_image(img).to(self.device)
-        deca_dict = self.deca.encode(image[None])
+        # image = self.deca.crop_image(img).to(self.device)
+        # deca_dict = self.deca.encode(image[None])
+        deca_dict = self.deca.encode(img[None])
         
         return deca_dict
     
